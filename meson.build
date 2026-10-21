@@ -13,8 +13,8 @@ executable('clipling',
   dependencies : [gtkmm, sqlite, layershell],
   install : true)
 
-# Темы встроены в бинарник и сами пишутся в ~/.config/clipling/themes при
-# первом запуске; копии в /usr/share — образцы для своих тем.
+# Themes are embedded in the binary and written to ~/.config/clipling/themes on
+# first run; the copies in /usr/share are samples for your own themes.
 install_data('themes/dark.css', 'themes/light.css', 'themes/pipboy.css',
   install_dir : get_option('datadir') / 'clipling' / 'themes')
 

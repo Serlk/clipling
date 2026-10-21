@@ -1,7 +1,7 @@
-/* clipling :: тёмная спокойная тема (breeze-dark / mac-ish). Основная.
- * Классы: window.clipling, .clipling-root, .clipling-search,
- *         .clipling-text row, .clipling-images, .clipling-tile,
- *         состояния анимации: .anim-in / .anim-out / .pulse
+/* clipling :: calm dark theme (breeze-dark / mac-ish). Default.
+ * Classes: window.clipling, .clipling-root, .clipling-search,
+ *          .clipling-text row, .clipling-images, .clipling-tile,
+ *          animation states: .anim-in / .anim-out / .pulse
  */
 @define-color bg     #1b1e24;
 @define-color fg     #e2e6ec;

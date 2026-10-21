@@ -1,5 +1,5 @@
-/* clipling :: тема pipboy (CRT / фосфор-зелёный, с глитчами). Опциональная.
- * Те же классы, но .anim-in/.anim-out/.pulse оформлены как CRT-глитч.
+/* clipling :: pipboy theme (CRT / phosphor green, with glitches). Optional.
+ * Same classes, but .anim-in / .anim-out / .pulse are styled as a CRT glitch.
  */
 window.clipling { color: rgba(140,255,185,0.92); font-family: "CodeNewRoman Nerd Font Propo", monospace; font-size:13px; }
 .clipling-root {
@@ -22,9 +22,9 @@ paned>separator { background:rgba(100,255,155,0.18); min-width:2px; }
 button { background:rgba(0,20,10,0.6); color:rgba(180,255,210,0.95); border:1px solid rgba(100,255,155,0.3); border-radius:2px; padding:6px 14px; }
 button.suggested-action { background:rgba(100,255,155,0.25); }
 
-/* Включение как у ЭЛТ: вспышка тонкой полосой -> раскрытие -> RGB-сдвиг
-   (красный/бирюзовый край у текста), рывки и перекос -> стабилизация.
-   Соседние кадры повторяют значения, чтобы сдвиги были скачками, а не плавным сползанием. */
+/* CRT power-on: thin flash line -> expand -> RGB split (red/cyan fringe on text),
+   jitter and skew -> settle. Neighbouring keyframes repeat values so the shifts
+   jump instead of sliding smoothly. */
 @keyframes crt-on {
   0%   { opacity:1; transform: scale(0.5, 0.006); filter: brightness(4); }
   14%  { transform: scale(1.02, 0.01); filter: brightness(3.5); }
@@ -45,7 +45,7 @@ button.suggested-action { background:rgba(100,255,155,0.25); }
   80%  { transform: none; filter: none; text-shadow: 0 0 6px rgba(80,255,140,0.35); }
   100% { opacity:1; transform: none; filter: none; text-shadow: 0 0 6px rgba(80,255,140,0.35); }
 }
-/* Выключение: дёрнулось -> схлопнулось в яркую линию -> в точку. */
+/* Power-off: a twitch -> collapse into a bright line -> into a dot. */
 @keyframes crt-off {
   0%   { opacity:1; transform: none; filter: none; }
   25%  { transform: translateX(5px) skewX(-4deg); filter: brightness(1.6);
@@ -54,7 +54,7 @@ button.suggested-action { background:rgba(100,255,155,0.25); }
   80%  { opacity:0.9; transform: scale(0.12, 0.006); filter: brightness(5); }
   100% { opacity:0; transform: scale(0, 0.004); }
 }
-/* «Подмиг» при Enter с несколькими совпадениями. */
+/* "Blink" on Enter with several matches. */
 @keyframes crt-glitch {
   0%   { transform: none; }
   20%  { transform: translateX(-6px) skewX(5deg); filter: hue-rotate(-30deg) brightness(1.5);

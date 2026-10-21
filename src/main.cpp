@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 serlk
 //
-// clipling — всплывающий буфер обмена поверх истории clipvault.
+// clipling — a popup clipboard picker on top of clipvault history.
 //
-// Хранение/перехват делает clipvault; clipling читает его SQLite-базу
-// (read-only) и рисует окно у курсора: слева текст (с живым поиском),
-// справа сетка превью картинок. Выбор -> wl-copy (primary + clipboard) ->
-// окно закрывается. Внешний вид/эффекты — в GTK CSS (темы).
+// clipvault does the capturing and storage; clipling reads its SQLite database
+// (read-only) and draws a window at the cursor: text with live search on the
+// left, a grid of image thumbnails on the right. Pick -> wl-copy (primary +
+// clipboard) -> the window closes. Look and effects live in GTK CSS (themes).
 //
-// Живёт резидентно: первый запуск поднимает процесс, следующие лишь просят
-// его показать окно (GApplication) — так открытие мгновенное, как у rofi.
+// Runs resident: the first launch starts the process, later ones just ask it
+// to show the window (GApplication) — that is what makes opening instant, like rofi.
 //
-// Сборка: meson (см. meson.build). Зависимости: gtkmm-4.0, gtk4-layer-shell, sqlite3.
+// Build: meson (see meson.build). Dependencies: gtkmm-4.0, gtk4-layer-shell, sqlite3.
 
 #include <gtkmm.h>
 #include <glibmm.h>
@@ -35,17 +35,17 @@
 namespace fs = std::filesystem;
 
 // =====================================================================
-//  Конфиг (хранится в ~/.config/clipling/clipling.ini через GKeyFile)
+//  Config (stored in ~/.config/clipling/clipling.ini via GKeyFile)
 // =====================================================================
 
 struct Config {
     int  width       = 820;
     int  height      = 480;
-    int  split       = 0;    // ширина текстовой панели, px (0 = авто ~58%)
-    int  gap         = 14;   // отступ окна от курсора
-    int  thumb       = 120;  // размер превью, px
-    int  image_cols  = 6;    // макс. колонок в сетке картинок
-    int  debounce_ms = 120;  // задержка живого фильтра
+    int  split       = 0;    // text panel width, px (0 = auto, ~58%)
+    int  gap         = 14;   // gap between the window and the cursor
+    int  thumb       = 120;  // thumbnail size, px
+    int  image_cols  = 6;    // max columns in the image grid
+    int  debounce_ms = 120;  // live filter delay
     bool animations  = true;
     bool copy_primary   = true;
     bool copy_clipboard = true;
@@ -96,19 +96,19 @@ static void save_config(const Config& c) {
 }
 
 // =====================================================================
-//  Данные истории
+//  History data
 // =====================================================================
 
-// Из базы при открытии берётся начало записи (подпись, сигнатура картинки) и
-// текст для поиска; картинка целиком — при копировании и в фоновом декодировании превью.
+// On open, only the start of an entry (label, image signature) and the text for
+// search are read; a full image is read when copying and when decoding thumbnails.
 struct Entry {
     int64_t     id = 0;
-    std::string mime;   // пусто -> текст
-    std::string text;   // краткая подпись (первая строка)
-    std::string hay;    // весь текст (до SEARCH_LIMIT), приведённый к fold_text()
+    std::string mime;   // empty -> text
+    std::string text;   // short label (first line)
+    std::string hay;    // full text (up to SEARCH_LIMIT), passed through fold_text()
 };
 
-static constexpr int SEARCH_LIMIT = 64 * 1024;   // искать дальше в гигантских записях незачем
+static constexpr int SEARCH_LIMIT = 64 * 1024;   // no point searching further into huge entries
 
 static std::string sniff_image_mime(const std::vector<uint8_t>& b) {
     auto has = [&](std::initializer_list<uint8_t> sig, size_t off = 0) {
@@ -132,14 +132,14 @@ static std::string first_line_utf8(const std::vector<uint8_t>& content) {
     std::string raw(content.begin(), content.end());
     if (auto nl = raw.find('\n'); nl != std::string::npos) raw.resize(nl);
     std::string line = valid_utf8(raw.data(), raw.size());
-    if (g_utf8_strlen(line.c_str(), -1) > 200) {          // режем по символам, не по байтам
+    if (g_utf8_strlen(line.c_str(), -1) > 200) {          // cut by characters, not bytes
         char* cut = g_utf8_substring(line.c_str(), 0, 200);
         line = cut; g_free(cut);
     }
     return line;
 }
 
-// Регистронезависимое сравнение для любых алфавитов (ascii-tolower не трогал кириллицу).
+// Case-insensitive matching for any alphabet (ascii tolower left Cyrillic untouched).
 static std::string fold_text(const std::string& s) {
     char* norm = g_utf8_normalize(s.c_str(), (gssize)s.size(), G_NORMALIZE_DEFAULT);
     if (!norm) return s;
@@ -151,7 +151,7 @@ static std::string fold_text(const std::string& s) {
 
 static std::string clipvault_db_path() {
     if (const char* env = g_getenv("CLIPVAULT_DB")) return env;
-    return std::string(g_get_user_data_dir()) + "/clipvault.db";   // как у clipvault: $XDG_DATA_HOME
+    return std::string(g_get_user_data_dir()) + "/clipvault.db";   // same as clipvault: $XDG_DATA_HOME
 }
 
 static sqlite3* open_db() {
@@ -167,8 +167,8 @@ static std::vector<Entry> load_entries() {
     std::vector<Entry> out;
     sqlite3* db = open_db();
     if (!db) return out;
-    // Обычно хватает первых 1024 байт; длинный текст дочитывается отдельно,
-    // чтобы не тянуть из базы картинки целиком.
+    // The first 1024 bytes are usually enough; long text is read separately
+    // so that full images are not pulled from the database.
     sqlite3_stmt* st = nullptr;
     sqlite3_stmt* more = nullptr;
     sqlite3_prepare_v2(db, "SELECT substr(content, 1, ?) FROM clipboard WHERE id = ?", -1, &more, nullptr);
@@ -203,7 +203,7 @@ static std::vector<Entry> load_entries() {
     return out;
 }
 
-// Отпечаток истории: не изменилась — список виджетов не пересобираем.
+// History fingerprint: if unchanged, the widget list is not rebuilt.
 static std::string history_stamp() {
     std::string out;
     sqlite3* db = open_db();
@@ -236,7 +236,7 @@ static std::vector<uint8_t> load_content(sqlite3* db, int64_t id) {
 static void wl_copy_once(const std::vector<uint8_t>& data, const std::string& mime, bool primary) {
     std::string cmd = "wl-copy";
     if (primary) cmd += " --primary";
-    if (!mime.empty()) cmd += " --type " + mime;   // mime из whitelist -> безопасно
+    if (!mime.empty()) cmd += " --type " + mime;   // mime comes from a whitelist -> safe
     FILE* p = popen(cmd.c_str(), "w");
     if (!p) return;
     if (!data.empty()) fwrite(data.data(), 1, data.size(), p);
@@ -254,12 +254,12 @@ static void copy_entry(const Entry& e, const Config& cfg) {
 }
 
 // =====================================================================
-//  Темы / CSS
+//  Themes / CSS
 // =====================================================================
 
-// Наш провайдер стоит выше пользовательского ~/.config/gtk-4.0/gtk.css, но
-// свойства, которые темы clipling не задают, системная тема всё равно
-// дорисовывает (фон списков, рамки, тени) — их явно гасим здесь.
+// Our provider sits above the user's ~/.config/gtk-4.0/gtk.css, but the system
+// theme still paints properties clipling themes don't set (list backgrounds,
+// borders, shadows) — they are reset explicitly here.
 static const char* BASE_CSS = R"CSS(
 window.clipling        { background: transparent; border: none; box-shadow: none; border-radius: 0; outline: none; }
 window.clipling list, window.clipling flowbox, window.clipling flowboxchild, window.clipling row,
@@ -370,9 +370,9 @@ paned>separator { background:rgba(100,255,155,0.18); min-width:2px; }
 button { background:rgba(0,20,10,0.6); color:rgba(180,255,210,0.95); border:1px solid rgba(100,255,155,0.3); border-radius:2px; padding:6px 14px; }
 button.suggested-action { background:rgba(100,255,155,0.25); }
 
-/* Включение как у ЭЛТ: вспышка тонкой полосой -> раскрытие -> RGB-сдвиг
-   (красный/бирюзовый край у текста), рывки и перекос -> стабилизация.
-   Соседние кадры повторяют значения, чтобы сдвиги были скачками, а не плавным сползанием. */
+/* CRT power-on: thin flash line -> expand -> RGB split (red/cyan fringe on text),
+   jitter and skew -> settle. Neighbouring keyframes repeat values so the shifts
+   jump instead of sliding smoothly. */
 @keyframes crt-on {
   0%   { opacity:1; transform: scale(0.5, 0.006); filter: brightness(4); }
   14%  { transform: scale(1.02, 0.01); filter: brightness(3.5); }
@@ -393,7 +393,7 @@ button.suggested-action { background:rgba(100,255,155,0.25); }
   80%  { transform: none; filter: none; text-shadow: 0 0 6px rgba(80,255,140,0.35); }
   100% { opacity:1; transform: none; filter: none; text-shadow: 0 0 6px rgba(80,255,140,0.35); }
 }
-/* Выключение: дёрнулось -> схлопнулось в яркую линию -> в точку. */
+/* Power-off: a twitch -> collapse into a bright line -> into a dot. */
 @keyframes crt-off {
   0%   { opacity:1; transform: none; filter: none; }
   25%  { transform: translateX(5px) skewX(-4deg); filter: brightness(1.6);
@@ -402,7 +402,7 @@ button.suggested-action { background:rgba(100,255,155,0.25); }
   80%  { opacity:0.9; transform: scale(0.12, 0.006); filter: brightness(5); }
   100% { opacity:0; transform: scale(0, 0.004); }
 }
-/* «Подмиг» при Enter с несколькими совпадениями. */
+/* "Blink" on Enter with several matches. */
 @keyframes crt-glitch {
   0%   { transform: none; }
   20%  { transform: translateX(-6px) skewX(5deg); filter: hue-rotate(-30deg) brightness(1.5);
@@ -445,20 +445,20 @@ static std::string read_theme_css(const std::string& name) {
     return DARK_CSS;
 }
 
-// Один провайдер на процесс: при каждом показе тема перечитывается в него же.
+// One provider per process: the theme is reloaded into it on every show.
 static void apply_css(const std::string& theme) {
     static Glib::RefPtr<Gtk::CssProvider> provider;
     if (!provider) {
         provider = Gtk::CssProvider::create();
         if (auto display = Gdk::Display::get_default())
-            // выше USER (~/.config/gtk-4.0/gtk.css), иначе системная тема перебивает нашу
+            // above USER (~/.config/gtk-4.0/gtk.css), otherwise the system theme overrides ours
             Gtk::StyleContext::add_provider_for_display(display, provider, GTK_STYLE_PROVIDER_PRIORITY_USER + 100);
     }
     provider->load_from_string(std::string(BASE_CSS) + "\n" + read_theme_css(theme));
 }
 
 // =====================================================================
-//  Позиционирование у курсора (Hyprland)
+//  Placement at the cursor (Hyprland)
 // =====================================================================
 
 static bool hypr_cursorpos(int& x, int& y) {
@@ -472,21 +472,21 @@ static bool hypr_cursorpos(int& x, int& y) {
 
 
 // =====================================================================
-//  Окно выбора
+//  Picker window
 // =====================================================================
 
 class Picker : public Gtk::ApplicationWindow {
 public:
-    // Окно создаётся один раз на процесс и дальше только прячется/показывается.
+    // The window is created once per process and then only hidden/shown.
     Picker() {
         set_title("clipling");
         set_decorated(false);
         add_css_class("clipling");
-        add_css_class("pre");   // невидимо до первого кадра — иначе анимация проиграется вхолостую
+        add_css_class("pre");   // invisible until the first frame, otherwise the animation plays unseen
 
-        // Прозрачный overlay-слой на весь монитор, панель рисуется у курсора.
-        // Клик мимо панели попадает в нас же -> закрываемся. Через потерю фокуса
-        // так не сделать: при follow_mouse фокус уходит от простого наведения.
+        // Transparent overlay layer over the whole monitor, the panel is drawn at the cursor.
+        // A click outside the panel still lands on us -> close. Focus loss can't do this:
+        // with follow_mouse, focus moves away on a mere hover.
         gtk_layer_init_for_window(Gtk::Window::gobj());
         gtk_layer_set_namespace(Gtk::Window::gobj(), "clipling");
         gtk_layer_set_layer(Gtk::Window::gobj(), GTK_LAYER_SHELL_LAYER_OVERLAY);
@@ -501,20 +501,20 @@ public:
         root_.set_valign(Gtk::Align::START);
         set_child(root_);
 
-        // ---- шапка: поиск + шестерёнка ----
+        // ---- header: search + gear ----
         auto header = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 0);
         header->add_css_class("clipling-header");
-        search_.set_placeholder_text("поиск…");
+        search_.set_placeholder_text("search…");
         search_.set_hexpand(true);
         search_.add_css_class("clipling-search");
         header->append(search_);
         gear_.set_label("⚙");               // ⚙
         gear_.add_css_class("clipling-gear");
-        gear_.set_tooltip_text("Настройки");
+        gear_.set_tooltip_text("Settings");
         header->append(gear_);
         root_.append(*header);
 
-        // ---- сплит ----
+        // ---- split ----
         paned_.set_vexpand(true); paned_.set_wide_handle(true);
         root_.append(paned_);
 
@@ -535,7 +535,7 @@ public:
         paned_.set_start_child(left_);
         paned_.set_end_child(right_);
 
-        // фильтры
+        // filters
         listbox_.set_filter_func([this](Gtk::ListBoxRow* row) {
             int i = row->get_index();
             if (i < 0 || (size_t)i >= text_rows_.size()) return true;
@@ -543,7 +543,7 @@ public:
         });
         flow_.set_filter_func([this](Gtk::FlowBoxChild*) { return query_.empty(); });
 
-        // активация -> копируем и закрываемся
+        // activation -> copy and close
         listbox_.signal_row_activated().connect([this](Gtk::ListBoxRow* row){
             int i = row->get_index();
             if (i >= 0 && (size_t)i < text_entries_.size()) copy_and_close(text_entries_[i]);
@@ -553,7 +553,7 @@ public:
             if (i >= 0 && (size_t)i < image_entries_.size()) copy_and_close(image_entries_[i]);
         });
 
-        // живой фильтр с дебаунсом
+        // live filter with debounce
         search_.signal_search_changed().connect([this]{
             query_ = fold_text(search_.get_text());
             if (filter_timer_.connected()) filter_timer_.disconnect();
@@ -562,10 +562,10 @@ public:
             }, cfg_.debounce_ms);
         });
 
-        // Enter в поиске
+        // Enter in the search field
         search_.signal_activate().connect([this]{ on_enter(); });
 
-        // Down из поиска -> в список; Esc -> закрыть
+        // Down from search -> into the list; Esc -> close
         auto sk = Gtk::EventControllerKey::create();
         sk->signal_key_pressed().connect([this](guint kv, guint, Gdk::ModifierType) -> bool {
             if (kv == GDK_KEY_Down) { focus_first_visible(); return true; }
@@ -581,16 +581,16 @@ public:
         }, false);
         add_controller(wk);
 
-        // overlay перекрыл бы окно настроек — уступаем ему место
+        // the overlay would cover the settings window — make way for it
         gear_.signal_clicked().connect([this]{ close_animated(); signal_settings_.emit(); });
 
-        // показать с анимацией после появления
-        // (запущенная до map анимация проигрывается вхолостую — отсюда её «не было»)
+        // show with the animation once mapped
+        // (an animation started before map plays unseen — that's why it "wasn't there")
         signal_map().connect([this]{
             Glib::signal_idle().connect_once([this]{ reveal(); });
         });
 
-        // клик мимо панели -> закрываемся
+        // click outside the panel -> close
         auto outside = Gtk::GestureClick::create();
         outside->set_button(0);
         outside->set_propagation_phase(Gtk::PropagationPhase::CAPTURE);
@@ -605,7 +605,7 @@ public:
 
     sigc::signal<void()>& signal_settings() { return signal_settings_; }
 
-    // Подтянуть конфиг, тему и историю заранее, не показывая окно.
+    // Load config, theme and history ahead of time without showing the window.
     void prepare() {
         cfg_ = load_config();
         apply_css(cfg_.theme);
@@ -617,7 +617,7 @@ public:
         if (stamp.empty() || stamp != stamp_) { stamp_ = stamp; populate(); }
     }
 
-    // Повторный вызов при открытом окне закрывает его — как у rofi.
+    // Calling again while the window is open closes it — like rofi.
     void toggle() {
         if (get_visible() && !closing_) { close_animated(); return; }
         open();
@@ -639,13 +639,13 @@ private:
         right_.get_vadjustment()->set_value(0);
 
         place_near_cursor();
-        if (get_visible()) reveal();   // закрывался — перезапускаем анимацию на месте
+        if (get_visible()) reveal();   // was closing — restart the animation in place
         else present();
         search_.grab_focus();
     }
 
     void populate() {
-        thumb_gen_++;                  // старый фоновый декодер бросит работу
+        thumb_gen_++;                  // the old background decoder will give up
         listbox_.remove_all();
         flow_.remove_all();
         text_entries_.clear(); image_entries_.clear(); text_rows_.clear(); pics_.clear();
@@ -682,12 +682,12 @@ private:
                 kept.insert(*it);
             } else pending.push_back(e.id);
         }
-        thumbs_ = std::move(kept);     // из кэша выпадают удалённые из истории
+        thumbs_ = std::move(kept);     // entries removed from history drop out of the cache
         if (!pending.empty()) decode_thumbs(std::move(pending), maxw, maxh);
     }
 
-    // Декодирование превью в фоне: окно не ждёт картинок, плитки
-    // заполняются по мере готовности.
+    // Thumbnails are decoded in the background: the window doesn't wait for
+    // images, tiles fill in as they become ready.
     void decode_thumbs(std::vector<int64_t> ids, int maxw, int maxh) {
         const unsigned gen = thumb_gen_;
         std::thread([this, ids = std::move(ids), maxw, maxh, gen]{
@@ -727,7 +727,7 @@ private:
         size_t total = vis.size() + (query_.empty() ? image_entries_.size() : 0);
         if (query_.empty() && vis.empty() && image_entries_.size() == 1) { copy_and_close(image_entries_[0]); return; }
         if (total == 1 && vis.size() == 1) { copy_and_close(text_entries_[vis[0]]); return; }
-        // несколько -> подмиг + подвести выбор к первому
+        // several -> blink + move the selection to the first one
         pulse();
         if (!vis.empty()) { if (auto* row = listbox_.get_row_at_index(vis.front())) { listbox_.select_row(*row); row->grab_focus(); } }
     }
@@ -742,7 +742,7 @@ private:
 
     void reveal() {
         if (closing_) return;
-        // anim-in остаётся до закрытия: последний кадр (fill both) = обычный вид
+        // anim-in stays until close: the last frame (fill both) equals the normal look
         if (cfg_.animations) add_css_class("anim-in");
         remove_css_class("pre");
     }
@@ -764,8 +764,8 @@ private:
         } else hide();
     }
 
-    // Слой покрывает монитор под курсором; панель ставится отступами внутри него.
-    // Без hyprctl курсор неизвестен -> панель по центру первого монитора.
+    // The layer covers the monitor under the cursor; the panel is placed by margins inside it.
+    // Without hyprctl the cursor is unknown -> the panel is centered on the first monitor.
     void place_near_cursor() {
         int cx = 0, cy = 0;
         bool have_cursor = hypr_cursorpos(cx, cy);
@@ -789,9 +789,9 @@ private:
         const int M = 8, GAP = cfg_.gap;
         int left = mon.get_x()+M, top = mon.get_y()+M;
         int right = mon.get_x()+mon.get_width()-M, bottom = mon.get_y()+mon.get_height()-M;
-        int x = cx + GAP, y = cy + GAP;                 // по умолчанию снизу-справа от курсора
-        if (x + W > right)  x = cx - GAP - W;           // не влезает справа -> слева
-        if (y + H > bottom) y = cy - GAP - H;           // не влезает снизу -> сверху
+        int x = cx + GAP, y = cy + GAP;                 // default: below and to the right of the cursor
+        if (x + W > right)  x = cx - GAP - W;           // doesn't fit on the right -> left
+        if (y + H > bottom) y = cy - GAP - H;           // doesn't fit below -> above
         x = std::clamp(x, left, std::max(left, right - W));
         y = std::clamp(y, top,  std::max(top,  bottom - H));
         if (W > mon.get_width()  - 2*M || !found) x = mon.get_x() + (mon.get_width()  - W)/2;
@@ -822,7 +822,7 @@ private:
 };
 
 // =====================================================================
-//  Окно настроек
+//  Settings window
 // =====================================================================
 
 class Settings : public Gtk::ApplicationWindow {
@@ -830,7 +830,7 @@ public:
     Settings() {
         cfg_ = load_config();
         apply_css(cfg_.theme);
-        set_title("clipling · настройки");
+        set_title("clipling · settings");
         set_default_size(420, 560);
         add_css_class("clipling");
 
@@ -839,7 +839,7 @@ public:
         root->add_css_class("clipling-settings");
         set_child(*root);
 
-        auto title = Gtk::make_managed<Gtk::Label>("Настройки clipling");
+        auto title = Gtk::make_managed<Gtk::Label>("clipling settings");
         title->add_css_class("title"); title->set_xalign(0.0f); title->set_margin_bottom(14);
         root->append(*title);
 
@@ -848,32 +848,32 @@ public:
         root->append(*grid);
         int r = 0;
 
-        // тема
+        // theme
         themes_ = list_themes();
         auto strlist = Gtk::StringList::create({});
         int sel = 0;
         for (size_t i = 0; i < themes_.size(); ++i) { strlist->append(themes_[i]); if (themes_[i] == cfg_.theme) sel = (int)i; }
         theme_dd_.set_model(strlist);
         theme_dd_.set_selected(sel);
-        add_row(*grid, r++, "Тема", theme_dd_);
+        add_row(*grid, r++, "Theme", theme_dd_);
 
-        setup_spin(w_spin_, 320, 2200, 10, cfg_.width);      add_row(*grid, r++, "Ширина окна, px", w_spin_);
-        setup_spin(h_spin_, 240, 1600, 10, cfg_.height);     add_row(*grid, r++, "Высота окна, px", h_spin_);
+        setup_spin(w_spin_, 320, 2200, 10, cfg_.width);      add_row(*grid, r++, "Window width, px", w_spin_);
+        setup_spin(h_spin_, 240, 1600, 10, cfg_.height);     add_row(*grid, r++, "Window height, px", h_spin_);
         setup_spin(split_spin_, 120, 2000, 10, cfg_.split > 0 ? cfg_.split : cfg_.width * 58 / 100);
-        add_row(*grid, r++, "Ширина панели текста, px", split_spin_);
-        setup_spin(gap_spin_, 0, 200, 2, cfg_.gap);          add_row(*grid, r++, "Отступ от курсора, px", gap_spin_);
-        setup_spin(thumb_spin_, 48, 320, 8, cfg_.thumb);     add_row(*grid, r++, "Размер превью, px", thumb_spin_);
-        setup_spin(cols_spin_, 1, 16, 1, cfg_.image_cols);   add_row(*grid, r++, "Колонок картинок", cols_spin_);
-        setup_spin(deb_spin_, 0, 1000, 10, cfg_.debounce_ms);add_row(*grid, r++, "Задержка фильтра, мс", deb_spin_);
+        add_row(*grid, r++, "Text panel width, px", split_spin_);
+        setup_spin(gap_spin_, 0, 200, 2, cfg_.gap);          add_row(*grid, r++, "Gap from cursor, px", gap_spin_);
+        setup_spin(thumb_spin_, 48, 320, 8, cfg_.thumb);     add_row(*grid, r++, "Thumbnail size, px", thumb_spin_);
+        setup_spin(cols_spin_, 1, 16, 1, cfg_.image_cols);   add_row(*grid, r++, "Image columns", cols_spin_);
+        setup_spin(deb_spin_, 0, 1000, 10, cfg_.debounce_ms);add_row(*grid, r++, "Filter delay, ms", deb_spin_);
 
-        anim_sw_.set_active(cfg_.animations);     anim_sw_.set_halign(Gtk::Align::START);  add_row(*grid, r++, "Анимации", anim_sw_);
-        prim_sw_.set_active(cfg_.copy_primary);   prim_sw_.set_halign(Gtk::Align::START);  add_row(*grid, r++, "Копировать в primary", prim_sw_);
-        clip_sw_.set_active(cfg_.copy_clipboard); clip_sw_.set_halign(Gtk::Align::START);  add_row(*grid, r++, "Копировать в clipboard", clip_sw_);
+        anim_sw_.set_active(cfg_.animations);     anim_sw_.set_halign(Gtk::Align::START);  add_row(*grid, r++, "Animations", anim_sw_);
+        prim_sw_.set_active(cfg_.copy_primary);   prim_sw_.set_halign(Gtk::Align::START);  add_row(*grid, r++, "Copy to primary", prim_sw_);
+        clip_sw_.set_active(cfg_.copy_clipboard); clip_sw_.set_halign(Gtk::Align::START);  add_row(*grid, r++, "Copy to clipboard", clip_sw_);
 
         auto buttons = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 10);
         buttons->set_halign(Gtk::Align::END); buttons->set_margin_top(18);
-        auto cancel = Gtk::make_managed<Gtk::Button>("Закрыть");
-        auto save   = Gtk::make_managed<Gtk::Button>("Сохранить");
+        auto cancel = Gtk::make_managed<Gtk::Button>("Close");
+        auto save   = Gtk::make_managed<Gtk::Button>("Save");
         save->add_css_class("suggested-action");
         cancel->signal_clicked().connect([this]{ hide(); });
         save->signal_clicked().connect([this]{ on_save(); });
@@ -904,7 +904,7 @@ private:
         cfg_.copy_primary = prim_sw_.get_active();
         cfg_.copy_clipboard = clip_sw_.get_active();
         save_config(cfg_);
-        apply_css(cfg_.theme);   // применить тему к этому окну сразу
+        apply_css(cfg_.theme);   // apply the theme to this window right away
         hide();
     }
 
@@ -926,26 +926,26 @@ static void open_settings(const Glib::RefPtr<Gtk::Application>& app) {
     st->present();
 }
 
-// clipling            — показать/спрятать окно выбора
-// clipling --settings — окно настроек
-// clipling --daemon   — только поднять процесс (для автозапуска), окно не показывать
-// clipling --quit     — завершить резидентный процесс (например, после пересборки)
+// clipling            — show/hide the picker
+// clipling --settings — settings window
+// clipling --daemon   — just start the process (for autostart), no window
+// clipling --quit     — stop the resident process (e.g. after a rebuild)
 int main(int argc, char* argv[]) {
     ensure_defaults();
 
-    // Валидный id нужен для единственного экземпляра: повторные запуски лишь
-    // пересылают аргументы живому процессу. Он же — class окна настроек в Hyprland.
+    // A valid id is needed for single-instance mode: later launches only forward
+    // their arguments to the running process. It is also the settings window class in Hyprland.
     Glib::set_prgname("clipling");
     auto app = Gtk::Application::create("io.github.serlk.clipling",
                                         Gio::Application::Flags::HANDLES_COMMAND_LINE);
     Picker* picker = nullptr;
 
     app->signal_startup().connect([&]{
-        app->hold();                       // живём и без видимых окон
+        app->hold();                       // stay alive without visible windows
         picker = new Picker();
         app->add_window(*picker);
         picker->signal_settings().connect([&]{ open_settings(app); });
-        picker->prepare();                 // история и превью — заранее
+        picker->prepare();                 // history and thumbnails ahead of time
     });
 
     app->signal_command_line().connect([&](const Glib::RefPtr<Gio::ApplicationCommandLine>& cl) -> int {
