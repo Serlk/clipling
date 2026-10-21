@@ -1,7 +1,7 @@
 # Maintainer: Serlk <22211586+Serlk at users dot noreply dot github dot com>
 
 pkgname=clipling
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='Popup clipboard picker for clipvault history: opens at the cursor, text and image previews (GTK4, layer-shell)'
 arch=('x86_64' 'aarch64')

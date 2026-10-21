@@ -1,5 +1,5 @@
 project('clipling', 'cpp',
-  version : '0.1.0',
+  version : '0.1.1',
   license : 'AGPL-3.0-only',
   meson_version : '>=0.60',
   default_options : ['cpp_std=c++20', 'warning_level=2'])
