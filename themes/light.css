@@ -1,0 +1,37 @@
+/* clipling :: светлая спокойная тема (breeze-light / mac-ish). Основная.
+ * Классы: window.clipling, .clipling-root, .clipling-search,
+ *         .clipling-text row, .clipling-images, .clipling-tile,
+ *         состояния анимации: .anim-in / .anim-out / .pulse
+ */
+@define-color bg     #fbfbfc;
+@define-color fg     #202327;
+@define-color sub    rgba(32,35,39,0.55);
+@define-color acc    #2d7fd6;
+@define-color sel    rgba(45,127,214,0.16);
+@define-color bord   rgba(0,0,0,0.10);
+
+window.clipling { font-family: "Inter","SF Pro Display",system-ui,sans-serif; font-size: 13px; }
+.clipling-root { background-color:@bg; color:@fg; border:1px solid @bord; box-shadow:0 12px 36px rgba(0,0,0,0.18); }
+.clipling-search { background:#ffffff; color:@fg; border:1px solid @bord; border-radius:8px; padding:6px 10px; caret-color:@acc; }
+.clipling-search:focus-within { border-color:@acc; }
+.clipling-text row:hover { background:rgba(0,0,0,0.04); }
+.clipling-text row:selected, .clipling-text row:active { background:@sel; }
+.clipling-tile:hover { background:rgba(0,0,0,0.04); }
+.clipling-tile:selected, .clipling-tile:active { background:@sel; }
+paned > separator { background:@bord; min-width:1px; }
+.clipling-gear { background:transparent; color:@sub; border:none; border-radius:8px; }
+.clipling-gear:hover { background:rgba(0,0,0,0.06); color:@fg; }
+button { background:#ffffff; color:@fg; border:1px solid @bord; border-radius:8px; padding:6px 14px; }
+button:hover { background:rgba(0,0,0,0.04); }
+button.suggested-action { background:@acc; color:#ffffff; border-color:transparent; }
+
+@keyframes fade-in  { from{opacity:0; transform:translateY(-6px) scale(0.97);} to{opacity:1; transform:none;} }
+@keyframes fade-out { from{opacity:1; transform:none;} to{opacity:0; transform:scale(0.97);} }
+@keyframes soft-pulse {
+  0%   { box-shadow:0 12px 36px rgba(0,0,0,0.18), inset 0 0 0 1px rgba(45,127,214,0.0); }
+  50%  { box-shadow:0 12px 36px rgba(0,0,0,0.18), inset 0 0 0 2px rgba(45,127,214,0.55); }
+  100% { box-shadow:0 12px 36px rgba(0,0,0,0.18), inset 0 0 0 1px rgba(45,127,214,0.0); }
+}
+window.clipling.anim-in  .clipling-root { animation: fade-in  110ms ease-out 1 both; }
+window.clipling.anim-out .clipling-root { animation: fade-out 100ms ease-in 1 both; }
+window.clipling.pulse    .clipling-root { animation: soft-pulse 220ms ease-in-out 1; }

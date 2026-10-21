@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=clipling settings
+Name[ru]=Настройки clipling
+Comment=Popup clipboard picker for clipvault history
+Comment[ru]=Всплывающий буфер обмена поверх истории clipvault
+Exec=clipling --settings
+Icon=edit-paste
+Terminal=false
+Categories=Utility;
+Keywords=clipboard;clipvault;history;
+StartupWMClass=io.github.serlk.clipling

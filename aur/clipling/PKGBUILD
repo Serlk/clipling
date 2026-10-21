@@ -1,0 +1,38 @@
+# Maintainer: Serlk <22211586+Serlk at users dot noreply dot github dot com>
+
+pkgname=clipling
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Popup clipboard picker for clipvault history: opens at the cursor, text and image previews (GTK4, layer-shell)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/Serlk/clipling'
+license=('AGPL-3.0-only')
+depends=(
+  'clipvault'
+  'gdk-pixbuf2'
+  'glib2'
+  'glibc'
+  'glibmm-2.68'
+  'gtk4'
+  'gtk4-layer-shell'
+  'gtkmm-4.0'
+  'libgcc'
+  'libsigc++-3.0'
+  'libstdc++'
+  'sqlite'
+  'wl-clipboard'
+)
+makedepends=('meson')
+optdepends=('hyprland: open the popup at the mouse cursor (via hyprctl)')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')  # заменить: updpkgsums после публикации тега v$pkgver
+
+build() {
+  arch-meson "$pkgname-$pkgver" build
+  meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+  install -Dm644 "$pkgname-$pkgver/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

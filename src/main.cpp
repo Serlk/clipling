@@ -1,0 +1,935 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 serlk
+//
+// clipling — всплывающий буфер обмена поверх истории clipvault.
+//
+// Хранение/перехват делает clipvault; clipling читает его SQLite-базу
+// (read-only) и рисует окно у курсора: слева текст (с живым поиском),
+// справа сетка превью картинок. Выбор -> wl-copy (primary + clipboard) ->
+// окно закрывается. Внешний вид/эффекты — в GTK CSS (темы).
+//
+// Живёт резидентно: первый запуск поднимает процесс, следующие лишь просят
+// его показать окно (GApplication) — так открытие мгновенное, как у rofi.
+//
+// Сборка: meson (см. meson.build). Зависимости: gtkmm-4.0, gtk4-layer-shell, sqlite3.
+
+#include <gtkmm.h>
+#include <glibmm.h>
+#include <giomm.h>
+#include <glib.h>
+#include <gtk4-layer-shell.h>
+#include <sqlite3.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <atomic>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+// =====================================================================
+//  Конфиг (хранится в ~/.config/clipling/clipling.ini через GKeyFile)
+// =====================================================================
+
+struct Config {
+    int  width       = 820;
+    int  height      = 480;
+    int  split       = 0;    // ширина текстовой панели, px (0 = авто ~58%)
+    int  gap         = 14;   // отступ окна от курсора
+    int  thumb       = 120;  // размер превью, px
+    int  image_cols  = 6;    // макс. колонок в сетке картинок
+    int  debounce_ms = 120;  // задержка живого фильтра
+    bool animations  = true;
+    bool copy_primary   = true;
+    bool copy_clipboard = true;
+    std::string theme = "dark";
+};
+
+static fs::path config_dir()  { return fs::path(g_get_user_config_dir()) / "clipling"; }
+static fs::path config_file() { return config_dir() / "clipling.ini"; }
+static fs::path themes_dir()  { return config_dir() / "themes"; }
+
+static Config load_config() {
+    Config c;
+    auto kf = Glib::KeyFile::create();
+    try { if (!kf->load_from_file(config_file().string())) return c; }
+    catch (...) { return c; }
+    auto gi = [&](const char* g, const char* k, int d)  { try { return kf->has_key(g,k)? kf->get_integer(g,k): d; } catch(...) { return d; } };
+    auto gb = [&](const char* g, const char* k, bool d) { try { return kf->has_key(g,k)? kf->get_boolean(g,k): d; } catch(...) { return d; } };
+    auto gs = [&](const char* g, const char* k, const std::string& d) { try { return kf->has_key(g,k)? std::string(kf->get_string(g,k)): d; } catch(...) { return d; } };
+    c.width         = gi("window","width",c.width);
+    c.height        = gi("window","height",c.height);
+    c.split         = gi("window","split",c.split);
+    c.gap           = gi("window","gap",c.gap);
+    c.thumb         = gi("behavior","thumb",c.thumb);
+    c.image_cols    = gi("behavior","image_cols",c.image_cols);
+    c.debounce_ms   = gi("behavior","debounce_ms",c.debounce_ms);
+    c.animations    = gb("effects","animations",c.animations);
+    c.copy_primary  = gb("copy","primary",c.copy_primary);
+    c.copy_clipboard= gb("copy","clipboard",c.copy_clipboard);
+    c.theme         = gs("theme","name",c.theme);
+    return c;
+}
+
+static void save_config(const Config& c) {
+    auto kf = Glib::KeyFile::create();
+    kf->set_integer("window","width",c.width);
+    kf->set_integer("window","height",c.height);
+    kf->set_integer("window","split",c.split);
+    kf->set_integer("window","gap",c.gap);
+    kf->set_integer("behavior","thumb",c.thumb);
+    kf->set_integer("behavior","image_cols",c.image_cols);
+    kf->set_integer("behavior","debounce_ms",c.debounce_ms);
+    kf->set_boolean("effects","animations",c.animations);
+    kf->set_boolean("copy","primary",c.copy_primary);
+    kf->set_boolean("copy","clipboard",c.copy_clipboard);
+    kf->set_string ("theme","name",c.theme);
+    std::error_code ec; fs::create_directories(config_dir(), ec);
+    std::ofstream(config_file()) << std::string(kf->to_data());
+}
+
+// =====================================================================
+//  Данные истории
+// =====================================================================
+
+// Из базы при открытии берётся только начало записи (на подпись и сигнатуру
+// картинки); целиком — при копировании и в фоновом декодировании превью.
+struct Entry {
+    int64_t     id = 0;
+    std::string mime;   // пусто -> текст
+    std::string text;   // краткая подпись
+};
+
+static std::string sniff_image_mime(const std::vector<uint8_t>& b) {
+    auto has = [&](std::initializer_list<uint8_t> sig, size_t off = 0) {
+        if (b.size() < off + sig.size()) return false;
+        size_t i = off; for (uint8_t c : sig) if (b[i++] != c) return false; return true;
+    };
+    if (has({0x89,'P','N','G',0x0D,0x0A,0x1A,0x0A})) return "image/png";
+    if (has({0xFF,0xD8,0xFF}))                       return "image/jpeg";
+    if (has({'B','M'}))                              return "image/bmp";
+    if (has({'G','I','F','8','7','a'}) || has({'G','I','F','8','9','a'})) return "image/gif";
+    if (has({'R','I','F','F'}) && has({'W','E','B','P'}, 8)) return "image/webp";
+    return {};
+}
+
+static std::string first_line_utf8(const std::vector<uint8_t>& content) {
+    std::string raw(content.begin(), content.end());
+    if (auto nl = raw.find('\n'); nl != std::string::npos) raw.resize(nl);
+    if (raw.size() > 200) raw.resize(200);
+    char* valid = g_utf8_make_valid(raw.c_str(), (gssize)raw.size());
+    std::string out = valid ? valid : ""; g_free(valid); return out;
+}
+
+static std::string clipvault_db_path() {
+    if (const char* env = g_getenv("CLIPVAULT_DB")) return env;
+    return std::string(g_get_user_data_dir()) + "/clipvault.db";   // как у clipvault: $XDG_DATA_HOME
+}
+
+static sqlite3* open_db() {
+    sqlite3* db = nullptr;
+    if (sqlite3_open_v2(clipvault_db_path().c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return nullptr;
+    }
+    return db;
+}
+
+static std::vector<Entry> load_entries() {
+    std::vector<Entry> out;
+    sqlite3* db = open_db();
+    if (!db) return out;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT id, substr(content, 1, 1024) FROM clipboard ORDER BY last_updated DESC",
+                           -1, &st, nullptr) == SQLITE_OK) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const auto* blob = (const uint8_t*)sqlite3_column_blob(st, 1);
+            int n = sqlite3_column_bytes(st, 1);
+            if (!blob || n <= 0) continue;
+            std::vector<uint8_t> head(blob, blob + n);
+            Entry e;
+            e.id = sqlite3_column_int64(st, 0);
+            e.mime = sniff_image_mime(head);
+            if (e.mime.empty()) e.text = first_line_utf8(head);
+            out.push_back(std::move(e));
+        }
+    }
+    if (st) sqlite3_finalize(st);
+    sqlite3_close(db);
+    return out;
+}
+
+// Отпечаток истории: не изменилась — список виджетов не пересобираем.
+static std::string history_stamp() {
+    std::string out;
+    sqlite3* db = open_db();
+    if (!db) return out;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT count(*), max(last_updated), max(id) FROM clipboard", -1, &st, nullptr) == SQLITE_OK
+        && sqlite3_step(st) == SQLITE_ROW)
+        out = Glib::ustring::compose("%1:%2:%3", sqlite3_column_int64(st, 0),
+                                     sqlite3_column_int64(st, 1), sqlite3_column_int64(st, 2));
+    if (st) sqlite3_finalize(st);
+    sqlite3_close(db);
+    return out;
+}
+
+static std::vector<uint8_t> load_content(sqlite3* db, int64_t id) {
+    std::vector<uint8_t> out;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT content FROM clipboard WHERE id = ?", -1, &st, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const auto* blob = (const uint8_t*)sqlite3_column_blob(st, 0);
+            int n = sqlite3_column_bytes(st, 0);
+            if (blob && n > 0) out.assign(blob, blob + n);
+        }
+    }
+    if (st) sqlite3_finalize(st);
+    return out;
+}
+
+static void wl_copy_once(const std::vector<uint8_t>& data, const std::string& mime, bool primary) {
+    std::string cmd = "wl-copy";
+    if (primary) cmd += " --primary";
+    if (!mime.empty()) cmd += " --type " + mime;   // mime из whitelist -> безопасно
+    FILE* p = popen(cmd.c_str(), "w");
+    if (!p) return;
+    if (!data.empty()) fwrite(data.data(), 1, data.size(), p);
+    pclose(p);
+}
+
+static void copy_entry(const Entry& e, const Config& cfg) {
+    sqlite3* db = open_db();
+    if (!db) return;
+    auto content = load_content(db, e.id);
+    sqlite3_close(db);
+    if (content.empty()) return;
+    if (cfg.copy_clipboard) wl_copy_once(content, e.mime, false);
+    if (cfg.copy_primary)   wl_copy_once(content, e.mime, true);
+}
+
+// =====================================================================
+//  Темы / CSS
+// =====================================================================
+
+// Наш провайдер стоит выше пользовательского ~/.config/gtk-4.0/gtk.css, но
+// свойства, которые темы clipling не задают, системная тема всё равно
+// дорисовывает (фон списков, рамки, тени) — их явно гасим здесь.
+static const char* BASE_CSS = R"CSS(
+window.clipling        { background: transparent; border: none; box-shadow: none; border-radius: 0; outline: none; }
+window.clipling list, window.clipling flowbox, window.clipling flowboxchild, window.clipling row,
+window.clipling scrolledwindow, window.clipling viewport { background: transparent; color: inherit; box-shadow: none; }
+window.clipling entry  { box-shadow: none; outline: none; }
+window.clipling.pre .clipling-root { opacity: 0; }
+.clipling-root         { margin: 6px; padding: 12px; border-radius: 12px; }
+.clipling-header       { margin-bottom: 10px; }
+.clipling-search       { }
+.clipling-gear         { min-width: 26px; min-height: 26px; padding: 2px 6px; }
+.clipling-images       { padding: 4px; }
+.clipling-tile         { padding: 4px; margin: 4px; border-radius: 8px; }
+.clipling-row          { padding: 8px 12px; border-radius: 6px; }
+.clipling-settings     { padding: 20px; }
+.clipling-settings label.title { font-weight: 700; font-size: 15px; }
+.clipling-settings .caption    { opacity: 0.6; font-size: 12px; }
+)CSS";
+
+static const char* DARK_CSS = R"CSS(
+@define-color bg     #1b1e24;
+@define-color fg     #e2e6ec;
+@define-color sub    rgba(226,230,236,0.55);
+@define-color acc    #3daee9;
+@define-color sel    rgba(61,174,233,0.22);
+@define-color bord   rgba(255,255,255,0.09);
+
+window.clipling { font-family: "Inter","SF Pro Display",system-ui,sans-serif; font-size: 13px; }
+.clipling-root { background-color:@bg; color:@fg; border:1px solid @bord; box-shadow:0 14px 44px rgba(0,0,0,0.5); }
+.clipling-search { background:rgba(255,255,255,0.05); color:@fg; border:1px solid @bord; border-radius:8px; padding:6px 10px; caret-color:@acc; }
+.clipling-search:focus-within { border-color:@acc; }
+.clipling-text row:hover { background:rgba(255,255,255,0.05); }
+.clipling-text row:selected, .clipling-text row:active { background:@sel; }
+.clipling-tile:hover { background:rgba(255,255,255,0.05); }
+.clipling-tile:selected, .clipling-tile:active { background:@sel; }
+paned > separator { background:@bord; min-width:1px; }
+.clipling-gear { background:transparent; color:@sub; border:none; border-radius:8px; }
+.clipling-gear:hover { background:rgba(255,255,255,0.07); color:@fg; }
+button { background:rgba(255,255,255,0.06); color:@fg; border:1px solid @bord; border-radius:8px; padding:6px 14px; }
+button:hover { background:rgba(255,255,255,0.10); }
+button.suggested-action { background:@acc; color:#081019; border-color:transparent; }
+
+@keyframes fade-in  { from{opacity:0; transform:translateY(-6px) scale(0.97);} to{opacity:1; transform:none;} }
+@keyframes fade-out { from{opacity:1; transform:none;} to{opacity:0; transform:scale(0.97);} }
+@keyframes soft-pulse {
+  0%   { box-shadow:0 14px 44px rgba(0,0,0,0.5), inset 0 0 0 1px rgba(61,174,233,0.0); }
+  50%  { box-shadow:0 14px 44px rgba(0,0,0,0.5), inset 0 0 0 2px rgba(61,174,233,0.6); }
+  100% { box-shadow:0 14px 44px rgba(0,0,0,0.5), inset 0 0 0 1px rgba(61,174,233,0.0); }
+}
+window.clipling.anim-in  .clipling-root { animation: fade-in  110ms ease-out 1 both; }
+window.clipling.anim-out .clipling-root { animation: fade-out 100ms ease-in 1 both; }
+window.clipling.pulse    .clipling-root { animation: soft-pulse 220ms ease-in-out 1; }
+)CSS";
+
+static const char* LIGHT_CSS = R"CSS(
+@define-color bg     #fbfbfc;
+@define-color fg     #202327;
+@define-color sub    rgba(32,35,39,0.55);
+@define-color acc    #2d7fd6;
+@define-color sel    rgba(45,127,214,0.16);
+@define-color bord   rgba(0,0,0,0.10);
+
+window.clipling { font-family: "Inter","SF Pro Display",system-ui,sans-serif; font-size: 13px; }
+.clipling-root { background-color:@bg; color:@fg; border:1px solid @bord; box-shadow:0 12px 36px rgba(0,0,0,0.18); }
+.clipling-search { background:#ffffff; color:@fg; border:1px solid @bord; border-radius:8px; padding:6px 10px; caret-color:@acc; }
+.clipling-search:focus-within { border-color:@acc; }
+.clipling-text row:hover { background:rgba(0,0,0,0.04); }
+.clipling-text row:selected, .clipling-text row:active { background:@sel; }
+.clipling-tile:hover { background:rgba(0,0,0,0.04); }
+.clipling-tile:selected, .clipling-tile:active { background:@sel; }
+paned > separator { background:@bord; min-width:1px; }
+.clipling-gear { background:transparent; color:@sub; border:none; border-radius:8px; }
+.clipling-gear:hover { background:rgba(0,0,0,0.06); color:@fg; }
+button { background:#ffffff; color:@fg; border:1px solid @bord; border-radius:8px; padding:6px 14px; }
+button:hover { background:rgba(0,0,0,0.04); }
+button.suggested-action { background:@acc; color:#ffffff; border-color:transparent; }
+
+@keyframes fade-in  { from{opacity:0; transform:translateY(-6px) scale(0.97);} to{opacity:1; transform:none;} }
+@keyframes fade-out { from{opacity:1; transform:none;} to{opacity:0; transform:scale(0.97);} }
+@keyframes soft-pulse {
+  0%   { box-shadow:0 12px 36px rgba(0,0,0,0.18), inset 0 0 0 1px rgba(45,127,214,0.0); }
+  50%  { box-shadow:0 12px 36px rgba(0,0,0,0.18), inset 0 0 0 2px rgba(45,127,214,0.55); }
+  100% { box-shadow:0 12px 36px rgba(0,0,0,0.18), inset 0 0 0 1px rgba(45,127,214,0.0); }
+}
+window.clipling.anim-in  .clipling-root { animation: fade-in  110ms ease-out 1 both; }
+window.clipling.anim-out .clipling-root { animation: fade-out 100ms ease-in 1 both; }
+window.clipling.pulse    .clipling-root { animation: soft-pulse 220ms ease-in-out 1; }
+)CSS";
+
+static const char* PIPBOY_CSS = R"CSS(
+window.clipling { color: rgba(140,255,185,0.92); font-family: "CodeNewRoman Nerd Font Propo", monospace; font-size:13px; }
+.clipling-root {
+  background-color: rgba(3,9,6,0.97);
+  background-image: repeating-linear-gradient(to bottom, rgba(0,0,0,0) 0px, rgba(0,0,0,0) 2px, rgba(0,25,10,0.35) 3px);
+  border:1px solid rgba(100,255,155,0.22);
+  border-radius: 2px;
+  box-shadow: inset 0 0 60px rgba(0,35,14,0.75), 0 0 22px rgba(0,255,120,0.12);
+  text-shadow: 0 0 6px rgba(80,255,140,0.35);
+}
+.clipling-row, .clipling-tile { border-radius: 0; }
+.clipling-search { background:rgba(0,20,10,0.6); color:rgba(180,255,210,0.95); border:1px solid rgba(100,255,155,0.3); border-radius:2px; }
+.clipling-text row:hover { background:rgba(100,255,155,0.10); }
+.clipling-text row:selected,.clipling-text row:active { background:rgba(100,255,155,0.20); }
+.clipling-tile:hover { background:rgba(100,255,155,0.14); }
+.clipling-tile:selected,.clipling-tile:active { background:rgba(100,255,155,0.22); }
+paned>separator { background:rgba(100,255,155,0.18); min-width:2px; }
+.clipling-gear { background:transparent; color:rgba(140,255,185,0.6); border:none; }
+.clipling-gear:hover { color:rgba(180,255,210,1); }
+button { background:rgba(0,20,10,0.6); color:rgba(180,255,210,0.95); border:1px solid rgba(100,255,155,0.3); border-radius:2px; padding:6px 14px; }
+button.suggested-action { background:rgba(100,255,155,0.25); }
+
+/* Включение как у ЭЛТ: вспышка тонкой полосой -> раскрытие -> RGB-сдвиг
+   (красный/бирюзовый край у текста), рывки и перекос -> стабилизация.
+   Соседние кадры повторяют значения, чтобы сдвиги были скачками, а не плавным сползанием. */
+@keyframes crt-on {
+  0%   { opacity:1; transform: scale(0.5, 0.006); filter: brightness(4); }
+  14%  { transform: scale(1.02, 0.01); filter: brightness(3.5); }
+  26%  { transform: scale(1, 1.04) translateX(-8px) skewX(6deg); filter: brightness(1.8) hue-rotate(-30deg);
+         text-shadow: -4px 0 rgba(255,40,90,0.9), 4px 0 rgba(0,255,240,0.9); }
+  36%  { transform: scale(1, 1.04) translateX(-8px) skewX(6deg); filter: brightness(1.8) hue-rotate(-30deg);
+         text-shadow: -4px 0 rgba(255,40,90,0.9), 4px 0 rgba(0,255,240,0.9); }
+  37%  { transform: translateX(7px) skewX(-4deg); filter: brightness(1.3) hue-rotate(35deg);
+         text-shadow: 5px 0 rgba(255,40,90,0.9), -5px 0 rgba(0,255,240,0.9); }
+  50%  { transform: translateX(7px) skewX(-4deg); filter: brightness(1.3) hue-rotate(35deg);
+         text-shadow: 5px 0 rgba(255,40,90,0.9), -5px 0 rgba(0,255,240,0.9); }
+  51%  { transform: translateX(-3px); opacity:0.7;
+         text-shadow: -2px 0 rgba(255,40,90,0.7), 2px 0 rgba(0,255,240,0.7); }
+  64%  { transform: translateX(-3px); opacity:0.7;
+         text-shadow: -2px 0 rgba(255,40,90,0.7), 2px 0 rgba(0,255,240,0.7); }
+  65%  { transform: translateX(2px) skewX(1deg); opacity:1; filter: brightness(1.2);
+         text-shadow: 1px 0 rgba(255,40,90,0.5), -1px 0 rgba(0,255,240,0.5); }
+  80%  { transform: none; filter: none; text-shadow: 0 0 6px rgba(80,255,140,0.35); }
+  100% { opacity:1; transform: none; filter: none; text-shadow: 0 0 6px rgba(80,255,140,0.35); }
+}
+/* Выключение: дёрнулось -> схлопнулось в яркую линию -> в точку. */
+@keyframes crt-off {
+  0%   { opacity:1; transform: none; filter: none; }
+  25%  { transform: translateX(5px) skewX(-4deg); filter: brightness(1.6);
+         text-shadow: 4px 0 rgba(255,40,90,0.9), -4px 0 rgba(0,255,240,0.9); }
+  55%  { opacity:1; transform: scale(1, 0.01); filter: brightness(4); }
+  80%  { opacity:0.9; transform: scale(0.12, 0.006); filter: brightness(5); }
+  100% { opacity:0; transform: scale(0, 0.004); }
+}
+/* «Подмиг» при Enter с несколькими совпадениями. */
+@keyframes crt-glitch {
+  0%   { transform: none; }
+  20%  { transform: translateX(-6px) skewX(5deg); filter: hue-rotate(-30deg) brightness(1.5);
+         text-shadow: -4px 0 rgba(255,40,90,0.9), 4px 0 rgba(0,255,240,0.9); }
+  45%  { transform: translateX(5px) skewX(-3deg); filter: hue-rotate(30deg);
+         text-shadow: 4px 0 rgba(255,40,90,0.9), -4px 0 rgba(0,255,240,0.9); }
+  70%  { transform: translateX(-2px); filter: none;
+         text-shadow: -1px 0 rgba(255,40,90,0.6), 1px 0 rgba(0,255,240,0.6); }
+  100% { transform: none; filter: none; text-shadow: 0 0 6px rgba(80,255,140,0.35); }
+}
+window.clipling.anim-in  .clipling-root { animation: crt-on  230ms linear 1 both; }
+window.clipling.anim-out .clipling-root { animation: crt-off 160ms linear 1 both; }
+window.clipling.pulse    .clipling-root { animation: crt-glitch 200ms linear 1; }
+)CSS";
+
+static void ensure_defaults() {
+    std::error_code ec; fs::create_directories(themes_dir(), ec);
+    auto w = [](const fs::path& p, const char* data){ if (!fs::exists(p)) std::ofstream(p) << data; };
+    w(themes_dir()/"dark.css",   DARK_CSS);
+    w(themes_dir()/"light.css",  LIGHT_CSS);
+    w(themes_dir()/"pipboy.css", PIPBOY_CSS);
+    if (!fs::exists(config_file())) save_config(Config{});
+}
+
+static std::vector<std::string> list_themes() {
+    std::vector<std::string> v;
+    std::error_code ec;
+    for (auto& e : fs::directory_iterator(themes_dir(), ec))
+        if (e.path().extension() == ".css") v.push_back(e.path().stem().string());
+    std::sort(v.begin(), v.end());
+    if (v.empty()) v = {"dark","light","pipboy"};
+    return v;
+}
+
+static std::string read_theme_css(const std::string& name) {
+    std::ifstream f(themes_dir() / (name + ".css"));
+    if (f) return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (name == "light")  return LIGHT_CSS;
+    if (name == "pipboy") return PIPBOY_CSS;
+    return DARK_CSS;
+}
+
+// Один провайдер на процесс: при каждом показе тема перечитывается в него же.
+static void apply_css(const std::string& theme) {
+    static Glib::RefPtr<Gtk::CssProvider> provider;
+    if (!provider) {
+        provider = Gtk::CssProvider::create();
+        if (auto display = Gdk::Display::get_default())
+            // выше USER (~/.config/gtk-4.0/gtk.css), иначе системная тема перебивает нашу
+            Gtk::StyleContext::add_provider_for_display(display, provider, GTK_STYLE_PROVIDER_PRIORITY_USER + 100);
+    }
+    provider->load_from_string(std::string(BASE_CSS) + "\n" + read_theme_css(theme));
+}
+
+// =====================================================================
+//  Позиционирование у курсора (Hyprland)
+// =====================================================================
+
+static bool hypr_cursorpos(int& x, int& y) {
+    std::string out;
+    try { Glib::spawn_command_line_sync("hyprctl cursorpos", &out); } catch (...) { return false; }
+    int cx, cy;
+    if (std::sscanf(out.c_str(), "%d, %d", &cx, &cy) == 2 ||
+        std::sscanf(out.c_str(), "%d %d",  &cx, &cy) == 2) { x = cx; y = cy; return true; }
+    return false;
+}
+
+
+// =====================================================================
+//  Окно выбора
+// =====================================================================
+
+class Picker : public Gtk::ApplicationWindow {
+public:
+    // Окно создаётся один раз на процесс и дальше только прячется/показывается.
+    Picker() {
+        set_title("clipling");
+        set_decorated(false);
+        add_css_class("clipling");
+        add_css_class("pre");   // невидимо до первого кадра — иначе анимация проиграется вхолостую
+
+        // Прозрачный overlay-слой на весь монитор, панель рисуется у курсора.
+        // Клик мимо панели попадает в нас же -> закрываемся. Через потерю фокуса
+        // так не сделать: при follow_mouse фокус уходит от простого наведения.
+        gtk_layer_init_for_window(Gtk::Window::gobj());
+        gtk_layer_set_namespace(Gtk::Window::gobj(), "clipling");
+        gtk_layer_set_layer(Gtk::Window::gobj(), GTK_LAYER_SHELL_LAYER_OVERLAY);
+        gtk_layer_set_keyboard_mode(Gtk::Window::gobj(), GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE);
+        gtk_layer_set_exclusive_zone(Gtk::Window::gobj(), -1);
+        for (auto edge : { GTK_LAYER_SHELL_EDGE_LEFT, GTK_LAYER_SHELL_EDGE_RIGHT,
+                           GTK_LAYER_SHELL_EDGE_TOP,  GTK_LAYER_SHELL_EDGE_BOTTOM })
+            gtk_layer_set_anchor(Gtk::Window::gobj(), edge, true);
+
+        root_.add_css_class("clipling-root");
+        root_.set_halign(Gtk::Align::START);
+        root_.set_valign(Gtk::Align::START);
+        set_child(root_);
+
+        // ---- шапка: поиск + шестерёнка ----
+        auto header = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 0);
+        header->add_css_class("clipling-header");
+        search_.set_placeholder_text("поиск…");
+        search_.set_hexpand(true);
+        search_.add_css_class("clipling-search");
+        header->append(search_);
+        gear_.set_label("⚙");               // ⚙
+        gear_.add_css_class("clipling-gear");
+        gear_.set_tooltip_text("Настройки");
+        header->append(gear_);
+        root_.append(*header);
+
+        // ---- сплит ----
+        paned_.set_vexpand(true); paned_.set_wide_handle(true);
+        root_.append(paned_);
+
+        listbox_.add_css_class("clipling-text");
+        listbox_.set_activate_on_single_click(true);
+        left_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+        left_.set_child(listbox_);
+
+        flow_.add_css_class("clipling-images");
+        flow_.set_selection_mode(Gtk::SelectionMode::SINGLE);
+        flow_.set_activate_on_single_click(true);
+        flow_.set_valign(Gtk::Align::START);
+        flow_.set_min_children_per_line(2);
+        flow_.set_homogeneous(true);
+        right_.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+        right_.set_child(flow_);
+
+        paned_.set_start_child(left_);
+        paned_.set_end_child(right_);
+
+        // фильтры
+        listbox_.set_filter_func([this](Gtk::ListBoxRow* row) {
+            int i = row->get_index();
+            if (i < 0 || (size_t)i >= text_rows_.size()) return true;
+            return query_.empty() || text_rows_[i].second.find(query_) != std::string::npos;
+        });
+        flow_.set_filter_func([this](Gtk::FlowBoxChild*) { return query_.empty(); });
+
+        // активация -> копируем и закрываемся
+        listbox_.signal_row_activated().connect([this](Gtk::ListBoxRow* row){
+            int i = row->get_index();
+            if (i >= 0 && (size_t)i < text_entries_.size()) copy_and_close(text_entries_[i]);
+        });
+        flow_.signal_child_activated().connect([this](Gtk::FlowBoxChild* ch){
+            int i = ch->get_index();
+            if (i >= 0 && (size_t)i < image_entries_.size()) copy_and_close(image_entries_[i]);
+        });
+
+        // живой фильтр с дебаунсом
+        search_.signal_search_changed().connect([this]{
+            query_ = search_.get_text(); to_lower(query_);
+            if (filter_timer_.connected()) filter_timer_.disconnect();
+            filter_timer_ = Glib::signal_timeout().connect([this]{
+                listbox_.invalidate_filter(); flow_.invalidate_filter(); return false;
+            }, cfg_.debounce_ms);
+        });
+
+        // Enter в поиске
+        search_.signal_activate().connect([this]{ on_enter(); });
+
+        // Down из поиска -> в список; Esc -> закрыть
+        auto sk = Gtk::EventControllerKey::create();
+        sk->signal_key_pressed().connect([this](guint kv, guint, Gdk::ModifierType) -> bool {
+            if (kv == GDK_KEY_Down) { focus_first_visible(); return true; }
+            if (kv == GDK_KEY_Escape) { close_animated(); return true; }
+            return false;
+        }, false);
+        search_.add_controller(sk);
+
+        auto wk = Gtk::EventControllerKey::create();
+        wk->signal_key_pressed().connect([this](guint kv, guint, Gdk::ModifierType) -> bool {
+            if (kv == GDK_KEY_Escape) { close_animated(); return true; }
+            return false;
+        }, false);
+        add_controller(wk);
+
+        // overlay перекрыл бы окно настроек — уступаем ему место
+        gear_.signal_clicked().connect([this]{ close_animated(); signal_settings_.emit(); });
+
+        // показать с анимацией после появления
+        // (запущенная до map анимация проигрывается вхолостую — отсюда её «не было»)
+        signal_map().connect([this]{
+            Glib::signal_idle().connect_once([this]{ reveal(); });
+        });
+
+        // клик мимо панели -> закрываемся
+        auto outside = Gtk::GestureClick::create();
+        outside->set_button(0);
+        outside->set_propagation_phase(Gtk::PropagationPhase::CAPTURE);
+        outside->signal_pressed().connect([this](int, double x, double y){
+            graphene_rect_t r;
+            if (!gtk_widget_compute_bounds(root_.Gtk::Widget::gobj(), Gtk::Widget::gobj(), &r)) return;
+            if (x < r.origin.x || y < r.origin.y ||
+                x > r.origin.x + r.size.width || y > r.origin.y + r.size.height) close_animated();
+        });
+        add_controller(outside);
+    }
+
+    sigc::signal<void()>& signal_settings() { return signal_settings_; }
+
+    // Подтянуть конфиг, тему и историю заранее, не показывая окно.
+    void prepare() {
+        cfg_ = load_config();
+        apply_css(cfg_.theme);
+        root_.set_size_request(cfg_.width, cfg_.height);
+        paned_.set_position(cfg_.split > 0 ? cfg_.split : cfg_.width * 58 / 100);
+        flow_.set_max_children_per_line(cfg_.image_cols);
+        if (cfg_.thumb != thumb_size_) { thumb_size_ = cfg_.thumb; thumbs_.clear(); stamp_.clear(); }
+        auto stamp = history_stamp();
+        if (stamp.empty() || stamp != stamp_) { stamp_ = stamp; populate(); }
+    }
+
+    // Повторный вызов при открытом окне закрывает его — как у rofi.
+    void toggle() {
+        if (get_visible() && !closing_) { close_animated(); return; }
+        open();
+    }
+
+private:
+    void open() {
+        if (hide_timer_.connected()) hide_timer_.disconnect();
+        prepare();
+        closing_ = false;
+        remove_css_class("anim-in"); remove_css_class("anim-out"); remove_css_class("pulse");
+        add_css_class("pre");
+
+        search_.set_text("");
+        query_.clear();
+        listbox_.invalidate_filter(); flow_.invalidate_filter();
+        listbox_.unselect_all(); flow_.unselect_all();
+        left_.get_vadjustment()->set_value(0);
+        right_.get_vadjustment()->set_value(0);
+
+        place_near_cursor();
+        if (get_visible()) reveal();   // закрывался — перезапускаем анимацию на месте
+        else present();
+        search_.grab_focus();
+    }
+
+    void populate() {
+        thumb_gen_++;                  // старый фоновый декодер бросит работу
+        listbox_.remove_all();
+        flow_.remove_all();
+        text_entries_.clear(); image_entries_.clear(); text_rows_.clear(); pics_.clear();
+
+        for (auto& e : load_entries()) {
+            if (e.mime.empty()) text_entries_.push_back(std::move(e));
+            else                image_entries_.push_back(std::move(e));
+        }
+        for (auto& e : text_entries_) {
+            auto row = Gtk::make_managed<Gtk::ListBoxRow>();
+            row->add_css_class("clipling-row");
+            auto lbl = Gtk::make_managed<Gtk::Label>(e.text);
+            lbl->set_xalign(0.0f);
+            lbl->set_ellipsize(Pango::EllipsizeMode::END);
+            row->set_child(*lbl);
+            listbox_.append(*row);
+            std::string hay = e.text; to_lower(hay);
+            text_rows_.push_back({ row, hay });
+        }
+
+        const int maxw = thumb_size_, maxh = thumb_size_ * 3 / 4;
+        std::vector<int64_t> pending;
+        std::map<int64_t, Glib::RefPtr<Gdk::Texture>> kept;
+        for (auto& e : image_entries_) {
+            auto child = Gtk::make_managed<Gtk::FlowBoxChild>();
+            child->add_css_class("clipling-tile");
+            auto pic = Gtk::make_managed<Gtk::Picture>();
+            pic->set_size_request(maxw, maxh);
+            pic->set_content_fit(Gtk::ContentFit::CONTAIN);
+            child->set_child(*pic);
+            flow_.append(*child);
+            pics_[e.id] = pic;
+            if (auto it = thumbs_.find(e.id); it != thumbs_.end()) {
+                pic->set_paintable(it->second);
+                kept.insert(*it);
+            } else pending.push_back(e.id);
+        }
+        thumbs_ = std::move(kept);     // из кэша выпадают удалённые из истории
+        if (!pending.empty()) decode_thumbs(std::move(pending), maxw, maxh);
+    }
+
+    // Декодирование превью в фоне: окно не ждёт картинок, плитки
+    // заполняются по мере готовности.
+    void decode_thumbs(std::vector<int64_t> ids, int maxw, int maxh) {
+        const unsigned gen = thumb_gen_;
+        std::thread([this, ids = std::move(ids), maxw, maxh, gen]{
+            sqlite3* db = open_db();
+            if (!db) return;
+            for (auto id : ids) {
+                if (gen != thumb_gen_) break;
+                auto data = load_content(db, id);
+                Glib::RefPtr<Gdk::Texture> tex;
+                try {
+                    auto stream = Gio::MemoryInputStream::create();
+                    stream->add_bytes(Glib::Bytes::create(data.data(), data.size()));
+                    auto pixbuf = Gdk::Pixbuf::create_from_stream(stream);
+                    if (!pixbuf) continue;
+                    int w = pixbuf->get_width(), h = pixbuf->get_height();
+                    if (w > 0 && h > 0) {
+                        double r = std::min({ (double)maxw / w, (double)maxh / h, 1.0 });
+                        pixbuf = pixbuf->scale_simple(std::max(1,(int)(w*r)), std::max(1,(int)(h*r)), Gdk::InterpType::BILINEAR);
+                    }
+                    tex = Gdk::Texture::create_for_pixbuf(pixbuf);
+                } catch (const Glib::Error&) { continue; }
+                Glib::MainContext::get_default()->invoke([this, id, tex, gen]{
+                    if (gen != thumb_gen_) return false;
+                    thumbs_[id] = tex;
+                    if (auto it = pics_.find(id); it != pics_.end()) it->second->set_paintable(tex);
+                    return false;
+                });
+            }
+            sqlite3_close(db);
+        }).detach();
+    }
+
+    void on_enter() {
+        std::vector<int> vis;
+        for (size_t i = 0; i < text_rows_.size(); ++i)
+            if (query_.empty() || text_rows_[i].second.find(query_) != std::string::npos) vis.push_back((int)i);
+        size_t total = vis.size() + (query_.empty() ? image_entries_.size() : 0);
+        if (query_.empty() && vis.empty() && image_entries_.size() == 1) { copy_and_close(image_entries_[0]); return; }
+        if (total == 1 && vis.size() == 1) { copy_and_close(text_entries_[vis[0]]); return; }
+        // несколько -> подмиг + подвести выбор к первому
+        pulse();
+        if (!vis.empty()) { if (auto* row = listbox_.get_row_at_index(vis.front())) { listbox_.select_row(*row); row->grab_focus(); } }
+    }
+
+    void focus_first_visible() {
+        for (size_t i = 0; i < text_rows_.size(); ++i)
+            if (query_.empty() || text_rows_[i].second.find(query_) != std::string::npos) {
+                if (auto* row = listbox_.get_row_at_index((int)i)) { listbox_.select_row(*row); row->grab_focus(); }
+                return;
+            }
+    }
+
+    void reveal() {
+        if (closing_) return;
+        // anim-in остаётся до закрытия: последний кадр (fill both) = обычный вид
+        if (cfg_.animations) add_css_class("anim-in");
+        remove_css_class("pre");
+    }
+
+    void pulse() {
+        if (!cfg_.animations) return;
+        add_css_class("pulse");
+        Glib::signal_timeout().connect_once([this]{ remove_css_class("pulse"); }, 260);
+    }
+
+    void copy_and_close(const Entry& e) { copy_entry(e, cfg_); close_animated(); }
+
+    void close_animated() {
+        if (closing_) return;
+        closing_ = true;
+        if (cfg_.animations) {
+            remove_css_class("anim-in"); add_css_class("anim-out");
+            hide_timer_ = Glib::signal_timeout().connect([this]{ hide(); return false; }, 170);
+        } else hide();
+    }
+
+    // Слой покрывает монитор под курсором; панель ставится отступами внутри него.
+    // Без hyprctl курсор неизвестен -> панель по центру первого монитора.
+    void place_near_cursor() {
+        int cx = 0, cy = 0;
+        bool have_cursor = hypr_cursorpos(cx, cy);
+        const int W = cfg_.width, H = cfg_.height;
+        Gdk::Rectangle mon; bool found = false;
+        Glib::RefPtr<Gdk::Monitor> mon_obj;
+        if (auto disp = Gdk::Display::get_default()) {
+            auto mons = disp->get_monitors();
+            for (guint i = 0; i < mons->get_n_items(); ++i) {
+                auto m = std::dynamic_pointer_cast<Gdk::Monitor>(mons->get_object(i));
+                if (!m) continue;
+                Gdk::Rectangle g; m->get_geometry(g);
+                if (i == 0) { mon = g; mon_obj = m; }
+                if (have_cursor && cx >= g.get_x() && cx < g.get_x()+g.get_width() && cy >= g.get_y() && cy < g.get_y()+g.get_height()) {
+                    mon = g; mon_obj = m; found = true; break;
+                }
+            }
+        }
+        if (mon_obj) gtk_layer_set_monitor(Gtk::Window::gobj(), mon_obj->gobj());
+        if (mon.get_width() <= 0) return;
+        const int M = 8, GAP = cfg_.gap;
+        int left = mon.get_x()+M, top = mon.get_y()+M;
+        int right = mon.get_x()+mon.get_width()-M, bottom = mon.get_y()+mon.get_height()-M;
+        int x = cx + GAP, y = cy + GAP;                 // по умолчанию снизу-справа от курсора
+        if (x + W > right)  x = cx - GAP - W;           // не влезает справа -> слева
+        if (y + H > bottom) y = cy - GAP - H;           // не влезает снизу -> сверху
+        x = std::clamp(x, left, std::max(left, right - W));
+        y = std::clamp(y, top,  std::max(top,  bottom - H));
+        if (W > mon.get_width()  - 2*M || !found) x = mon.get_x() + (mon.get_width()  - W)/2;
+        if (H > mon.get_height() - 2*M || !found) y = mon.get_y() + (mon.get_height() - H)/2;
+        root_.set_margin_start(x - mon.get_x());
+        root_.set_margin_top(y - mon.get_y());
+    }
+
+    static void to_lower(std::string& s) { for (auto& c : s) c = (char)g_ascii_tolower(c); }
+
+    Config cfg_;
+    Gtk::Box         root_{Gtk::Orientation::VERTICAL, 0};
+    Gtk::Paned       paned_{Gtk::Orientation::HORIZONTAL};
+    Gtk::ScrolledWindow left_, right_;
+    Gtk::SearchEntry search_;
+    Gtk::Button      gear_;
+    Gtk::ListBox     listbox_;
+    Gtk::FlowBox     flow_;
+    std::vector<Entry> text_entries_, image_entries_;
+    std::vector<std::pair<Gtk::ListBoxRow*, std::string>> text_rows_;
+    std::map<int64_t, Gtk::Picture*> pics_;
+    std::map<int64_t, Glib::RefPtr<Gdk::Texture>> thumbs_;
+    std::atomic<unsigned> thumb_gen_{0};
+    int thumb_size_ = 0;
+    std::string stamp_;
+    std::string query_;
+    sigc::connection filter_timer_, hide_timer_;
+    sigc::signal<void()> signal_settings_;
+    bool closing_ = false;
+};
+
+// =====================================================================
+//  Окно настроек
+// =====================================================================
+
+class Settings : public Gtk::ApplicationWindow {
+public:
+    Settings() {
+        cfg_ = load_config();
+        apply_css(cfg_.theme);
+        set_title("clipling · настройки");
+        set_default_size(420, 560);
+        add_css_class("clipling");
+
+        auto root = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::VERTICAL, 0);
+        root->add_css_class("clipling-root");
+        root->add_css_class("clipling-settings");
+        set_child(*root);
+
+        auto title = Gtk::make_managed<Gtk::Label>("Настройки clipling");
+        title->add_css_class("title"); title->set_xalign(0.0f); title->set_margin_bottom(14);
+        root->append(*title);
+
+        auto grid = Gtk::make_managed<Gtk::Grid>();
+        grid->set_row_spacing(12); grid->set_column_spacing(14);
+        root->append(*grid);
+        int r = 0;
+
+        // тема
+        themes_ = list_themes();
+        auto strlist = Gtk::StringList::create({});
+        int sel = 0;
+        for (size_t i = 0; i < themes_.size(); ++i) { strlist->append(themes_[i]); if (themes_[i] == cfg_.theme) sel = (int)i; }
+        theme_dd_.set_model(strlist);
+        theme_dd_.set_selected(sel);
+        add_row(*grid, r++, "Тема", theme_dd_);
+
+        setup_spin(w_spin_, 320, 2200, 10, cfg_.width);      add_row(*grid, r++, "Ширина окна, px", w_spin_);
+        setup_spin(h_spin_, 240, 1600, 10, cfg_.height);     add_row(*grid, r++, "Высота окна, px", h_spin_);
+        setup_spin(split_spin_, 120, 2000, 10, cfg_.split > 0 ? cfg_.split : cfg_.width * 58 / 100);
+        add_row(*grid, r++, "Ширина панели текста, px", split_spin_);
+        setup_spin(gap_spin_, 0, 200, 2, cfg_.gap);          add_row(*grid, r++, "Отступ от курсора, px", gap_spin_);
+        setup_spin(thumb_spin_, 48, 320, 8, cfg_.thumb);     add_row(*grid, r++, "Размер превью, px", thumb_spin_);
+        setup_spin(cols_spin_, 1, 16, 1, cfg_.image_cols);   add_row(*grid, r++, "Колонок картинок", cols_spin_);
+        setup_spin(deb_spin_, 0, 1000, 10, cfg_.debounce_ms);add_row(*grid, r++, "Задержка фильтра, мс", deb_spin_);
+
+        anim_sw_.set_active(cfg_.animations);     anim_sw_.set_halign(Gtk::Align::START);  add_row(*grid, r++, "Анимации", anim_sw_);
+        prim_sw_.set_active(cfg_.copy_primary);   prim_sw_.set_halign(Gtk::Align::START);  add_row(*grid, r++, "Копировать в primary", prim_sw_);
+        clip_sw_.set_active(cfg_.copy_clipboard); clip_sw_.set_halign(Gtk::Align::START);  add_row(*grid, r++, "Копировать в clipboard", clip_sw_);
+
+        auto buttons = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 10);
+        buttons->set_halign(Gtk::Align::END); buttons->set_margin_top(18);
+        auto cancel = Gtk::make_managed<Gtk::Button>("Закрыть");
+        auto save   = Gtk::make_managed<Gtk::Button>("Сохранить");
+        save->add_css_class("suggested-action");
+        cancel->signal_clicked().connect([this]{ hide(); });
+        save->signal_clicked().connect([this]{ on_save(); });
+        buttons->append(*cancel); buttons->append(*save);
+        root->append(*buttons);
+    }
+
+private:
+    static void setup_spin(Gtk::SpinButton& s, int lo, int hi, int step, int val) {
+        s.set_range(lo, hi); s.set_increments(step, step*5); s.set_value(val); s.set_halign(Gtk::Align::START);
+    }
+    static void add_row(Gtk::Grid& g, int r, const char* label, Gtk::Widget& ctrl) {
+        auto l = Gtk::make_managed<Gtk::Label>(label);
+        l->set_xalign(0.0f); l->set_hexpand(true);
+        g.attach(*l, 0, r); g.attach(ctrl, 1, r);
+    }
+    void on_save() {
+        guint idx = theme_dd_.get_selected();
+        if (idx != GTK_INVALID_LIST_POSITION && idx < themes_.size()) cfg_.theme = themes_[idx];
+        cfg_.width = w_spin_.get_value_as_int();
+        cfg_.height = h_spin_.get_value_as_int();
+        cfg_.split = split_spin_.get_value_as_int();
+        cfg_.gap = gap_spin_.get_value_as_int();
+        cfg_.thumb = thumb_spin_.get_value_as_int();
+        cfg_.image_cols = cols_spin_.get_value_as_int();
+        cfg_.debounce_ms = deb_spin_.get_value_as_int();
+        cfg_.animations = anim_sw_.get_active();
+        cfg_.copy_primary = prim_sw_.get_active();
+        cfg_.copy_clipboard = clip_sw_.get_active();
+        save_config(cfg_);
+        apply_css(cfg_.theme);   // применить тему к этому окну сразу
+        hide();
+    }
+
+    Config cfg_;
+    std::vector<std::string> themes_;
+    Gtk::DropDown  theme_dd_;
+    Gtk::SpinButton w_spin_, h_spin_, split_spin_, gap_spin_, thumb_spin_, cols_spin_, deb_spin_;
+    Gtk::Switch     anim_sw_, prim_sw_, clip_sw_;
+};
+
+// =====================================================================
+
+static void open_settings(const Glib::RefPtr<Gtk::Application>& app) {
+    for (auto* w : app->get_windows())
+        if (auto* st = dynamic_cast<Settings*>(w)) { st->present(); return; }
+    auto* st = new Settings();
+    app->add_window(*st);
+    st->signal_hide().connect([st]{ Glib::signal_idle().connect_once([st]{ delete st; }); });
+    st->present();
+}
+
+// clipling            — показать/спрятать окно выбора
+// clipling --settings — окно настроек
+// clipling --daemon   — только поднять процесс (для автозапуска), окно не показывать
+// clipling --quit     — завершить резидентный процесс (например, после пересборки)
+int main(int argc, char* argv[]) {
+    ensure_defaults();
+
+    // Валидный id нужен для единственного экземпляра: повторные запуски лишь
+    // пересылают аргументы живому процессу. Он же — class окна настроек в Hyprland.
+    Glib::set_prgname("clipling");
+    auto app = Gtk::Application::create("io.github.serlk.clipling",
+                                        Gio::Application::Flags::HANDLES_COMMAND_LINE);
+    Picker* picker = nullptr;
+
+    app->signal_startup().connect([&]{
+        app->hold();                       // живём и без видимых окон
+        picker = new Picker();
+        app->add_window(*picker);
+        picker->signal_settings().connect([&]{ open_settings(app); });
+        picker->prepare();                 // история и превью — заранее
+    });
+
+    app->signal_command_line().connect([&](const Glib::RefPtr<Gio::ApplicationCommandLine>& cl) -> int {
+        int n = 0;
+        char** args = cl->get_arguments(n);
+        bool settings = false, daemon = false, quit = false;
+        for (int i = 1; i < n; ++i) {
+            std::string a = args[i];
+            if (a == "--settings") settings = true;
+            else if (a == "--daemon") daemon = true;
+            else if (a == "--quit") quit = true;
+        }
+        g_strfreev(args);
+        if (quit) app->quit();
+        else if (settings) open_settings(app);
+        else if (!daemon) picker->toggle();
+        return 0;
+    }, false);
+
+    return app->run(argc, argv);
+}

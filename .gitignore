@@ -1,0 +1,10 @@
+/build/
+/.cache/
+compile_commands.json
+*.o
+
+# makepkg
+/aur/*/src/
+/aur/*/pkg/
+/aur/*/clipling/
+/aur/*/*.tar.*
