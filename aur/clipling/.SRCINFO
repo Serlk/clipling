@@ -1,6 +1,6 @@
 pkgbase = clipling
 	pkgdesc = Popup clipboard picker for clipvault history: opens at the cursor, text and image previews (GTK4, layer-shell)
-	pkgver = 0.1.0
+	pkgver = 0.1.1
 	pkgrel = 1
 	url = https://github.com/Serlk/clipling
 	arch = x86_64
@@ -21,7 +21,7 @@ pkgbase = clipling
 	depends = sqlite
 	depends = wl-clipboard
 	optdepends = hyprland: open the popup at the mouse cursor (via hyprctl)
-	source = clipling-0.1.0.tar.gz::https://github.com/Serlk/clipling/archive/refs/tags/v0.1.0.tar.gz
-	sha256sums = 8d2c68749fefa95b697924ef8681288d6debf9ae6be1209d2603ba8db22a93dd
+	source = clipling-0.1.1.tar.gz::https://github.com/Serlk/clipling/archive/refs/tags/v0.1.1.tar.gz
+	sha256sums = 9dfe44a7404c145907ae9417905acd97ceb94921e462bcb69f602429291e5ab2
 
 pkgname = clipling

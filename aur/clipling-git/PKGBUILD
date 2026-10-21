@@ -2,7 +2,7 @@
 
 pkgname=clipling-git
 _pkgname=clipling
-pkgver=0.1.0.r0.gf029143
+pkgver=0.1.1.r0.g3e00ad4
 pkgrel=1
 pkgdesc='Popup clipboard picker for clipvault history: opens at the cursor, text and image previews (GTK4, layer-shell) (git version)'
 arch=('x86_64' 'aarch64')
