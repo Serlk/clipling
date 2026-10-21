@@ -99,13 +99,16 @@ static void save_config(const Config& c) {
 //  Данные истории
 // =====================================================================
 
-// Из базы при открытии берётся только начало записи (на подпись и сигнатуру
-// картинки); целиком — при копировании и в фоновом декодировании превью.
+// Из базы при открытии берётся начало записи (подпись, сигнатура картинки) и
+// текст для поиска; картинка целиком — при копировании и в фоновом декодировании превью.
 struct Entry {
     int64_t     id = 0;
     std::string mime;   // пусто -> текст
-    std::string text;   // краткая подпись
+    std::string text;   // краткая подпись (первая строка)
+    std::string hay;    // весь текст (до SEARCH_LIMIT), приведённый к fold_text()
 };
+
+static constexpr int SEARCH_LIMIT = 64 * 1024;   // искать дальше в гигантских записях незачем
 
 static std::string sniff_image_mime(const std::vector<uint8_t>& b) {
     auto has = [&](std::initializer_list<uint8_t> sig, size_t off = 0) {
@@ -120,12 +123,30 @@ static std::string sniff_image_mime(const std::vector<uint8_t>& b) {
     return {};
 }
 
+static std::string valid_utf8(const char* data, size_t n) {
+    char* valid = g_utf8_make_valid(data, (gssize)n);
+    std::string out = valid ? valid : ""; g_free(valid); return out;
+}
+
 static std::string first_line_utf8(const std::vector<uint8_t>& content) {
     std::string raw(content.begin(), content.end());
     if (auto nl = raw.find('\n'); nl != std::string::npos) raw.resize(nl);
-    if (raw.size() > 200) raw.resize(200);
-    char* valid = g_utf8_make_valid(raw.c_str(), (gssize)raw.size());
-    std::string out = valid ? valid : ""; g_free(valid); return out;
+    std::string line = valid_utf8(raw.data(), raw.size());
+    if (g_utf8_strlen(line.c_str(), -1) > 200) {          // режем по символам, не по байтам
+        char* cut = g_utf8_substring(line.c_str(), 0, 200);
+        line = cut; g_free(cut);
+    }
+    return line;
+}
+
+// Регистронезависимое сравнение для любых алфавитов (ascii-tolower не трогал кириллицу).
+static std::string fold_text(const std::string& s) {
+    char* norm = g_utf8_normalize(s.c_str(), (gssize)s.size(), G_NORMALIZE_DEFAULT);
+    if (!norm) return s;
+    char* folded = g_utf8_casefold(norm, -1);
+    std::string out = folded ? folded : s;
+    g_free(norm); g_free(folded);
+    return out;
 }
 
 static std::string clipvault_db_path() {
@@ -146,8 +167,12 @@ static std::vector<Entry> load_entries() {
     std::vector<Entry> out;
     sqlite3* db = open_db();
     if (!db) return out;
+    // Обычно хватает первых 1024 байт; длинный текст дочитывается отдельно,
+    // чтобы не тянуть из базы картинки целиком.
     sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db, "SELECT id, substr(content, 1, 1024) FROM clipboard ORDER BY last_updated DESC",
+    sqlite3_stmt* more = nullptr;
+    sqlite3_prepare_v2(db, "SELECT substr(content, 1, ?) FROM clipboard WHERE id = ?", -1, &more, nullptr);
+    if (sqlite3_prepare_v2(db, "SELECT id, substr(content, 1, 1024), length(content) FROM clipboard ORDER BY last_updated DESC",
                            -1, &st, nullptr) == SQLITE_OK) {
         while (sqlite3_step(st) == SQLITE_ROW) {
             const auto* blob = (const uint8_t*)sqlite3_column_blob(st, 1);
@@ -157,11 +182,23 @@ static std::vector<Entry> load_entries() {
             Entry e;
             e.id = sqlite3_column_int64(st, 0);
             e.mime = sniff_image_mime(head);
-            if (e.mime.empty()) e.text = first_line_utf8(head);
+            if (e.mime.empty()) {
+                e.text = first_line_utf8(head);
+                std::string full((const char*)blob, n);
+                if (sqlite3_column_int64(st, 2) > n && more) {
+                    sqlite3_reset(more);
+                    sqlite3_bind_int(more, 1, SEARCH_LIMIT);
+                    sqlite3_bind_int64(more, 2, e.id);
+                    if (sqlite3_step(more) == SQLITE_ROW)
+                        full.assign((const char*)sqlite3_column_blob(more, 0), sqlite3_column_bytes(more, 0));
+                }
+                e.hay = fold_text(valid_utf8(full.data(), full.size()));
+            }
             out.push_back(std::move(e));
         }
     }
     if (st) sqlite3_finalize(st);
+    if (more) sqlite3_finalize(more);
     sqlite3_close(db);
     return out;
 }
@@ -518,7 +555,7 @@ public:
 
         // живой фильтр с дебаунсом
         search_.signal_search_changed().connect([this]{
-            query_ = search_.get_text(); to_lower(query_);
+            query_ = fold_text(search_.get_text());
             if (filter_timer_.connected()) filter_timer_.disconnect();
             filter_timer_ = Glib::signal_timeout().connect([this]{
                 listbox_.invalidate_filter(); flow_.invalidate_filter(); return false;
@@ -625,8 +662,7 @@ private:
             lbl->set_ellipsize(Pango::EllipsizeMode::END);
             row->set_child(*lbl);
             listbox_.append(*row);
-            std::string hay = e.text; to_lower(hay);
-            text_rows_.push_back({ row, hay });
+            text_rows_.push_back({ row, std::move(e.hay) });
         }
 
         const int maxw = thumb_size_, maxh = thumb_size_ * 3 / 4;
@@ -763,8 +799,6 @@ private:
         root_.set_margin_start(x - mon.get_x());
         root_.set_margin_top(y - mon.get_y());
     }
-
-    static void to_lower(std::string& s) { for (auto& c : s) c = (char)g_ascii_tolower(c); }
 
     Config cfg_;
     Gtk::Box         root_{Gtk::Orientation::VERTICAL, 0};
