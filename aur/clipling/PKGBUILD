@@ -25,7 +25,7 @@ depends=(
 makedepends=('meson')
 optdepends=('hyprland: open the popup at the mouse cursor (via hyprctl)')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')  # заменить: updpkgsums после публикации тега v$pkgver
+sha256sums=('8d2c68749fefa95b697924ef8681288d6debf9ae6be1209d2603ba8db22a93dd')
 
 build() {
   arch-meson "$pkgname-$pkgver" build
